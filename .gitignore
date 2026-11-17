@@ -64,3 +64,6 @@ htmlcov/
 .GEMINI.md
 AGENTS.md
 *.log
+
+# Obsidian
+.obsidian/

@@ -1,0 +1,26 @@
+---
+description: Mandatory local-first long-term memory read, write, and concurrency protocol across the software lifecycle.
+alwaysApply: true
+---
+
+# Long-Term Memory Protocol
+
+You operate against a local, Git-tracked Open Knowledge Format (OKF v0.3) memory store in `memory/` backed by the `mcp-memory` MCP server.
+
+## 1. Mandatory Read Before Plan or Code
+- Read `memory/index.md` at the start of every task to orient yourself.
+- Query `memory_search` or `memory_retrieve` in `discovery` and `architecture` namespaces before proposing designs, modifying schemas, or implementing features.
+- Treat records with `verified: true` and `status: active` as hard constraints. Never contradict an active ADR without explicit user approval.
+
+## 2. Granularity & Write Discipline
+- Store **decisions, user constraints, API contracts, and deployment runbooks** only. Never store line-by-line code summaries (Git tracks code diffs).
+- Use deterministic kebab-case keys prefixed by type: `story-`, `adr-`, `contract-`, `runbook-`.
+- Always set `verified: false` on agent-created or agent-updated records. Only humans mark records `verified: true`.
+
+## 3. Optimistic Concurrency Control (CAS)
+- Always call `memory_retrieve` to read the current `version` before updating an existing record.
+- Pass `expected_version` on every `memory_store` call (`0` for new records, exact current `version` for updates).
+- On `VersionConflictError`: re-read the updated record, merge your non-conflicting additions, increment `expected_version`, and retry once.
+
+## 4. Session Checkpoints
+- Write session progress exclusively to `sessions/<your-session-id>.md`. Never write to a shared global checkpoint key.

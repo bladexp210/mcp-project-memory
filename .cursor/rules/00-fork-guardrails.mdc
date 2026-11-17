@@ -1,0 +1,24 @@
+---
+description: Strict engineering guardrails and specification-driven workflow for developing the mcp-memory fork.
+alwaysApply: true
+---
+
+# Fork Development Guardrails
+
+You are modifying the `mcp-project-memory` MCP server codebase. Follow these rules without exception.
+In any conflict between general agent skills and specs/*.md or 00-fork-guardrails.mdc, the local specs and guardrails always take precedence.
+
+## 1. Specification-Driven Execution Loop
+- Read `specs/00-master-architecture.md` and the target `specs/0X-*.md` file before editing any Python code.
+- Implement **one specification file per task**. Never combine multiple spec files into one edit pass.
+- Write failing `pytest` unit and concurrency tests in `tests/` **before** writing implementation code.
+- A task is incomplete until `pytest` exits with status `0` and zero warnings.
+
+## 2. Boundary Protection
+- Never modify files inside `templates/` unless explicitly instructed to update downstream project templates.
+- Preserve backward compatibility for existing MCP tool names (`memory_store`, `memory_retrieve`, `memory_search`, `memory_delete`) by using optional parameters with safe defaults.
+
+## 3. Storage & Concurrency Invariants
+- All SQLite connections must enable `PRAGMA journal_mode=WAL;` and `PRAGMA busy_timeout=5000;`.
+- All Markdown file writes must be atomic: write to a temporary file in the same directory, flush, `os.fsync()`, and execute `os.replace()`.
+- Never catch broad `Exception` blocks silently. Return structured JSON error payloads with explicit `error_code` fields over MCP.
