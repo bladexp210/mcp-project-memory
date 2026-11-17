@@ -505,22 +505,30 @@ class TestMCPTools(unittest.TestCase):
     def test_last_memory_tools_flow(self):
         project_root = tempfile.mkdtemp()
         try:
-            # 1. memory_get_last before checkpoint exists
+            # 1. memory_get_last before checkpoint exists (defaults to session_id="default")
             res_initial = memory_get_last(project_root=project_root)
-            self.assertIn("No previous 'last-memory' checkpoint found", res_initial)
+            self.assertIn("No previous session checkpoint found", res_initial)
+            self.assertIn("deprecation_notice", res_initial)
 
-            # 2. memory_update_last
+            # 2. memory_update_last → memory/sessions/default.md
             res_update = memory_update_last(
                 content="Completed feature work. Active goal in [Agent Goal](/discovery/runbook-agent-goal.md).",
                 summary="Feature X complete",
                 project_root=project_root,
             )
             self.assertIn("Successfully updated last memory checkpoint", res_update)
+            self.assertIn("deprecation_notice", res_update)
+            self.assertIn("memory_checkpoint_set", res_update)
+            expected_path = os.path.join(project_root, "memory", "sessions", "default.md")
+            self.assertTrue(os.path.exists(expected_path), expected_path)
 
             # 3. memory_get_last after checkpoint updated
             res_get = memory_get_last(project_root=project_root)
             self.assertIn("LAST SESSION CHECKPOINT", res_get)
+            self.assertIn("deprecation_notice", res_get)
             self.assertIn("type: checkpoint", res_get)
+            self.assertIn("namespace: sessions", res_get)
+            self.assertIn("key: default", res_get)
             self.assertIn("Feature X complete", res_get)
             self.assertIn("Active goal in [Agent Goal](/discovery/runbook-agent-goal.md)", res_get)
         finally:

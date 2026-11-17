@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from okf_engine import (
     DEFAULT_NAMESPACE,
+    KEY_PATTERN,
     compute_file_sha256,
     compute_payload_sha256,
     get_memory_file_path,
@@ -26,6 +27,9 @@ from okf_engine import (
     sync_memory_to_disk,
     validate_okf_conformance,
 )
+
+SESSIONS_NAMESPACE = "sessions"
+CHECKPOINT_TYPE = "checkpoint"
 
 from pathlib import Path
 
@@ -61,6 +65,142 @@ class VersionConflictError(Exception):
             "actual_version": self.actual_version,
             "current_record": self.current_record,
         }
+
+
+class InvalidSessionIdError(Exception):
+    """Raised when a session_id fails kebab-case / path-safety validation."""
+
+    error_code = "INVALID_SESSION_ID"
+
+    def __init__(self, session_id: str, message: Optional[str] = None) -> None:
+        self.session_id = session_id
+        detail = message or (
+            f"Invalid session_id '{session_id}': must be single-segment kebab-case "
+            f"matching {KEY_PATTERN.pattern}."
+        )
+        super().__init__(detail)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error_code": self.error_code,
+            "session_id": self.session_id,
+            "message": str(self),
+        }
+
+
+def validate_session_id(session_id: str) -> str:
+    """Validate session_id as a single kebab-case segment (no path traversal)."""
+    if session_id is None or not str(session_id).strip():
+        raise InvalidSessionIdError(
+            session_id if session_id is not None else "",
+            "Invalid session_id: must be a non-empty kebab-case identifier.",
+        )
+    clean = str(session_id).strip()
+    if clean.endswith(".md"):
+        clean = clean[:-3]
+    # Reject separators / traversal before the kebab regex so error_code stays consistent.
+    if "/" in clean or "\\" in clean or clean in (".", "..") or ".." in clean:
+        raise InvalidSessionIdError(session_id)
+    if not KEY_PATTERN.match(clean):
+        raise InvalidSessionIdError(session_id)
+    return clean
+
+
+def format_checkpoint_body(
+    summary: str,
+    active_keys: List[str],
+    next_steps: List[str],
+) -> str:
+    """Render checkpoint markdown sections for summary / active_keys / next_steps."""
+    lines: List[str] = ["## summary", "", (summary or "").strip(), ""]
+    lines.append("## active_keys")
+    lines.append("")
+    if active_keys:
+        for key in active_keys:
+            lines.append(f"- {key}")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+    lines.append("## next_steps")
+    lines.append("")
+    if next_steps:
+        for step in next_steps:
+            lines.append(f"- {step}")
+    else:
+        lines.append("- (none)")
+    return "\n".join(lines)
+
+
+def set_session_checkpoint(
+    session_id: str,
+    summary: str,
+    active_keys: Optional[List[str]] = None,
+    next_steps: Optional[List[str]] = None,
+    project_root: Optional[str] = None,
+    db_path: Optional[str] = None,
+    memories_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create or update ``memory/sessions/<session_id>.md`` with automatic CAS version bump.
+
+    Holds the per-session file lock for the duration of the version read + atomic write
+    by delegating to ``store_memory`` (which already serializes writers per key).
+    """
+    clean_id = validate_session_id(session_id)
+    keys = list(active_keys) if active_keys is not None else []
+    steps = list(next_steps) if next_steps is not None else []
+    body = format_checkpoint_body(summary=summary, active_keys=keys, next_steps=steps)
+
+    # Retry on rare same-session races; distinct session_ids use distinct locks.
+    last_conflict: Optional[VersionConflictError] = None
+    for _ in range(8):
+        existing = retrieve_memory(
+            key=clean_id,
+            namespace=SESSIONS_NAMESPACE,
+            db_path=db_path,
+            project_root=project_root,
+        )
+        expected_version = 0
+        if existing is not None:
+            expected_version = int(existing["frontmatter"]["version"])
+        try:
+            return store_memory(
+                key=clean_id,
+                content=body,
+                tags=["checkpoint", "session"],
+                namespace=SESSIONS_NAMESPACE,
+                concept_type=CHECKPOINT_TYPE,
+                title=f"Session Checkpoint ({clean_id})",
+                description=(summary or "").strip() or f"Checkpoint for session {clean_id}",
+                status="active",
+                updated_by="agent:mcp-memory",
+                verified=False,
+                expected_version=expected_version,
+                db_path=db_path,
+                memories_dir=memories_dir,
+                project_root=project_root,
+            )
+        except VersionConflictError as exc:
+            last_conflict = exc
+            continue
+    assert last_conflict is not None
+    raise last_conflict
+
+
+def get_session_checkpoint(
+    session_id: str,
+    project_root: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Retrieve a session checkpoint record, or None if missing."""
+    clean_id = validate_session_id(session_id)
+    return retrieve_memory(
+        key=clean_id,
+        namespace=SESSIONS_NAMESPACE,
+        db_path=db_path,
+        project_root=project_root,
+    )
+
 
 def get_project_root() -> Path:
     """Returns the project root directory, or falls back to user home if cwd is root '/' or unwritable."""
