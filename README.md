@@ -1,144 +1,67 @@
-# MCP-Memory: OKF-Backed Agent Memory Server
+# MCP Project Memory
 
-**MCP-Memory** is a Model Context Protocol (MCP) server that equips AI agents (such as Claude Desktop, Cursor, Antigravity, Windsurf, or Codex) with persistent, long-term memory capabilities.
-
-Memory records are formatted using the [**Open Knowledge Format (OKF v0.2)**](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) standard and indexed with a local **SQLite** instance (supporting FTS5 full-text search) for fast key-value lookups, tag filtering, and content search.
-
-> **Fast Track:** [Jump directly to Quick Start](#quick-start)
+Local-first MCP server for durable agent memory. Git-tracked **OKF v0.3** Markdown under `memory/` is the Human-in-the-Loop (HITL) source of truth; SQLite WAL + FTS5 in `.mcp_memory/memories.db` is a derived search index.
 
 ---
 
-## Key Features
+## 1. Overview & Architecture
 
-* **Persistent State Across Sessions:** Enables AI agents to read, store, search, and delete stateful memory snippets that persist across chat turns and sessions.
-* **OKF Standard Compliance:** Stores every memory item formatted as an OKF v0.2 Markdown document with YAML frontmatter (`type`, `key`, `namespace`, `tags`, `generated`, `sources`, `verified`, `status`, `stale_after`), adhering strictly to [`SPEC.md`](SPEC.md) and [`OKF_RULES.md`](OKF_RULES.md).
-* **Dual-Layer Architecture:**
-  - **Human-Browseable OKF Directory**: Automatically dumps and syncs every memory to disk as a raw `.md` file inside the `memory/` bundle directory with hierarchical `index.md` progressive disclosure files (root `index.md` versioned with `okf_version: "0.2"`) and `log.md` update history tracking.
-  - **High-Performance SQLite Indexing**: SQLite FTS5 (Full-Text Search) and automatic triggers for sub-20ms key lookups and instant keyword searches.
-* **Namespace Isolation:** Supports contextual separation (e.g. `user/preferences`, `project/architecture`, `default`).
-* **Zero Boilerplate Setup:** Quick setup wizard (`python3 setup.py`) auto-configures installed MCP tools (Antigravity, Claude, Cursor, Windsurf, Codex).
+Agents and humans share one on-disk knowledge bundle:
 
----
+| Layer | Path | Role |
+| :--- | :--- | :--- |
+| **HITL source of truth** | `memory/<namespace>/<key>.md` | Git-tracked Open Knowledge Format (OKF **v0.3**) Markdown with YAML frontmatter |
+| **Derived index** | `.mcp_memory/memories.db` | SQLite with `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`, FTS5 (`memories_fts`), and `file_hashes` for SHA-256 sync |
+| **CAS locks** | `.mcp_memory/locks/<namespace>_<key>.lock` | Per-key `fcntl.flock` exclusive locks for concurrent `memory_store` |
 
-## MCP Tools
+**Hybrid pattern:** MCP tools write Markdown first (atomic temp + `fsync` + `os.replace`), then upsert SQLite in the same logical update. Humans may edit, add, or delete files under `memory/` directly (or via Git). `reconcile_memory_store()` re-hashes disk and syncs the index at server startup and before `memory_retrieve` / `memory_search`. Manual disk changes bypass CAS because disk is canonical for HITL audit.
 
-The server exposes six MCP tools to interacting agents:
+Closed namespaces (always under `memory/<namespace>/`):
 
-### 1. `memory_store`
-Stores or updates a memory record in OKF v0.2 format.
-* **Parameters:**
-  - `key` *(string, required)*: Unique identifier or path for the memory (e.g. `user/preferences/coding_style` or `project/architecture`).
-  - `content` *(string or object, required)*: Core information to store.
-  - `project_root` *(string, required)*: Absolute path to the active project root directory (e.g. `/Users/user/Projects/my-app`).
-  - `tags` *(array of strings, optional)*: Classification tags for filtering.
-  - `namespace` *(string, optional, default: `"default"`)*: Scope/namespace.
-  - `concept_type` *(string, optional, default: `"Agent Memory"`)*: OKF concept type (e.g. `Metric`, `Playbook`, `Attested Computation`).
-  - `title` *(string, optional)*: Display name.
-  - `description` *(string, optional)*: One-line summary.
-  - `resource` *(string, optional)*: Canonical URI of underlying asset.
-  - `status` *(string, optional, default: `"stable"`)*: Lifecycle state (`draft` | `stable` | `deprecated`).
-  - `stale_after` *(string, optional)*: ISO date (`YYYY-MM-DD`).
-  - `sources` *(array of objects, optional)*: Provenance sources `[{resource, id, title, author, usage_count, last_modified}]`.
-  - `verified` *(array of objects or object, optional)*: Verification events `[{by, at}]`.
-  - `generated_by` *(string, optional)*: Actor identifier following actor convention (`<producer>/<version>`, `human:<id>`, `process:<id>`).
+`discovery` · `architecture` · `contracts` · `deployment` · `sessions`
 
-### 2. `memory_retrieve`
-Retrieves a specific memory by its key and namespace.
-* **Parameters:**
-  - `key` *(string, required)*: The memory key to look up.
-  - `project_root` *(string, required)*: Absolute path to the active project root directory.
-  - `namespace` *(string, optional, default: `"default"`)*: Scope/namespace.
+Default namespace for store/retrieve/delete is `discovery`.
 
-### 3. `memory_search`
-Finds memories matching keywords, tags, or namespace filters.
-* **Parameters:**
-  - `project_root` *(string, required)*: Absolute path to the active project root directory.
-  - `query` *(string, optional)*: Keyword search query across keys, frontmatter, and content.
-  - `tags` *(array of strings, optional)*: Filter by specific tags.
-  - `namespace` *(string, optional)*: Scope search to a namespace.
-  - `limit` *(integer, optional, default: 10)*: Maximum number of results.
+**Environment variables** (optional; relative paths resolve against the project root):
 
-### 4. `memory_delete`
-Removes a specific memory record by its key and namespace, from both the SQLite index and the `memory/` bundle on disk.
-* **Parameters:**
-  - `key` *(string, required)*: The key of the memory to remove.
-  - `project_root` *(string, required)*: Absolute path to the active project root directory.
-  - `namespace` *(string, optional, default: `"default"`)*: Scope/namespace.
-
-### 5. `memory_get_last`
-**AGENT DIRECTIVE (Session Start):** Retrieves the last recorded session checkpoint (`system/last_memory`) so the AI agent immediately knows where work was left off when opening a project or starting a session.
-* **Parameters:**
-  - `project_root` *(string, required)*: Absolute path to active project root directory.
-  - `namespace` *(string, optional, default: `"default"`)*: Scope/namespace.
-
-### 6. `memory_update_last`
-**AGENT DIRECTIVE (Milestones & Progress):** Updates the canonical session checkpoint (`system/last_memory`) whenever completing a milestone, making key changes, or pausing work.
-* **Parameters:**
-  - `content` *(string or object, required)*: Brief note or structured dictionary summarizing progress and referencing key memory files.
-  - `project_root` *(string, required)*: Absolute path to active project root directory.
-  - `namespace` *(string, optional, default: `"default"`)*: Scope/namespace.
-  - `summary` *(string, optional)*: One-sentence description of the milestone achieved.
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `MCP_MEMORY_PROJECT_ROOT` | caller cwd (set by `run.sh`) | Project root for relative paths |
+| `MCP_MEMORY_DB_PATH` | `.mcp_memory/memories.db` | SQLite database path |
+| `MCP_MEMORY_DIR` | `memory` | OKF Markdown bundle directory |
 
 ---
 
-## OKF (Open Knowledge Format) Structure
+## 2. Installation & Project Setup
 
-Every stored memory strictly adheres to the OKF v0.2 specification ([`SPEC.md`](SPEC.md) & [`OKF_RULES.md`](OKF_RULES.md)):
-
-```markdown
----
-type: Agent Memory
-title: Coding Style
-key: user/preferences/coding_style
-namespace: default
-tags:
-- preferences
-- style
-status: stable
-generated:
-  by: mcp-memory/0.2.0
-  at: '2026-08-12T19:23:35Z'
-created_at: '2026-08-12T19:23:35Z'
-updated_at: '2026-08-12T19:23:35Z'
----
-
-User prefers functional programming style with explicit type annotations.
-```
-
----
-
-## Quick Start
-
-### 1. Clone the Repository
-```bash
-git clone https://github.com/fellowgeek/mcp-memory
-cd mcp-memory
-```
-
-### 2. Interactive Setup Wizard
-Run `setup.py` to auto-detect and register `mcp-memory` with your AI tools:
+### 2.1 Clone and virtualenv
 
 ```bash
-python3 setup.py
+git clone <this-repo>
+cd mcp-project-memory
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
-> **Note:** Once `setup.py` finishes configuring your tools, your AI client will launch `mcp-memory` automatically in the background whenever needed. You do not need to manually start or keep a server process running in your terminal.
+`run.sh` also creates `.venv` and installs deps on first launch, then execs `memory_server.py`.
 
-### 3. Run Manually via CLI (Optional / Debugging)
-If you want to manually verify startup, inspect stdio output, or pre-initialize the virtual environment (`.venv`), you can run `run.sh` directly:
+### 2.2 Global MCP server registration
+
+Register the server with your coding clients (Cursor, Claude Desktop, Antigravity, Windsurf, Codex, etc.):
 
 ```bash
-./run.sh
+.venv/bin/python setup.py
 ```
 
----
+Useful flags:
 
-## Manual Client Configuration
+| Flag | Effect |
+| :--- | :--- |
+| `--tool N` | Non-interactive tool choice (`1`–`8`; see wizard). Default when non-interactive: configure all (`8`) |
+| `--non-interactive` | Skip prompts; use defaults |
+| `--no-config-edit` | Print/skip config writes instead of editing client files |
 
-If you prefer to configure your MCP client manually, add the `"memory"` server entry pointing to `run.sh`:
-
-### JSON Configuration (Antigravity, Claude Desktop, Cursor, Windsurf)
-Add to your client's `mcp_config.json` or `claude_desktop_config.json`:
+The wizard points clients at this repo’s `run.sh`. Manual JSON shape:
 
 ```json
 {
@@ -150,45 +73,295 @@ Add to your client's `mcp_config.json` or `claude_desktop_config.json`:
 }
 ```
 
-### TOML Configuration (Codex Desktop)
-Add to `~/.codex/config.toml`:
+Codex Desktop uses TOML (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.memory]
 command = "/ABSOLUTE/PATH/TO/run.sh"
 ```
 
-### CLI Configuration
+### 2.3 Downstream project scaffolding
 
-- **Claude Code CLI:**
-  ```bash
-  claude mcp add --scope user memory -- /ABSOLUTE/PATH/TO/run.sh
-  ```
-- **Codex CLI:**
-  ```bash
-  codex mcp add memory -- /ABSOLUTE/PATH/TO/run.sh
-  ```
+Scaffold OKF v0.3 protocol files into an existing project:
+
+```bash
+.venv/bin/python setup.py --init-project <target_dir> [--force]
+```
+
+| Flag | Effect |
+| :--- | :--- |
+| `--init-project TARGET_DIR` | Non-interactive scaffold into `TARGET_DIR` |
+| `--force` | Overwrite existing scaffolded files |
+
+What gets installed:
+
+| Artifact | Destination |
+| :--- | :--- |
+| Memory protocol rule | `<target>/.cursor/rules/memory-protocol.mdc` |
+| Lifecycle skills | `<target>/.cursor/skills/{ingest-artifact,log-adr,triage-stale-memory}/SKILL.md` |
+| Pre-commit validator | `<target>/scripts/validate_memory.py` (executable) |
+| Namespace dirs + `.gitkeep` | `<target>/memory/{discovery,architecture,contracts,deployment,sessions}/` |
+| Git pre-commit hook | If `<target>/.git/hooks` exists: ensures `python3 scripts/validate_memory.py` runs (creates or appends) |
+
+Existing files are skipped unless `--force` is set. Hook status is reported as `created`, `appended`, or `unchanged`.
 
 ---
 
-## Testing
+## 3. OKF v0.3 Schema Specification
 
-Run the automated test suite to verify OKF serialization, SQLite database operations, and FastMCP tool execution:
+Every record is Markdown with YAML frontmatter. On-disk path: `memory/<namespace>/<key>.md`. Filename stem must equal `key`.
 
-```bash
-python3 test_memory.py
+### Required / documented frontmatter fields
+
+| Field | Constraint |
+| :--- | :--- |
+| `schema_version` | Must be `"0.3"` |
+| `key` | Single-segment kebab-case: `^[a-z0-9]+(?:-[a-z0-9]+)*$` |
+| `namespace` | Closed set (below) |
+| `type` | Closed set (below) |
+| `version` | Integer `>= 1`; CAS increments by `+1` on each successful agent update |
+| `updated_at` | ISO-8601 UTC (e.g. `2026-11-17T10:09:00Z`) |
+| `updated_by` | `agent:<id>` or `human:<username>` |
+| `status` | `draft` \| `active` \| `superseded` \| `deprecated` |
+| `verified` | **Boolean**. Agents must not set `true` |
+| `stale_after` | ISO date (`YYYY-MM-DD`); default is ~90 days ahead when omitted on store |
+| `supersedes` | Optional key of replaced record, or omit / `null` |
+| `tags` | List (may be empty) |
+| `sources` | List (may be empty; strings or mappings) |
+
+Optional display fields: `title`, `description`, `resource`.
+
+### Closed namespaces
+
+`discovery` · `architecture` · `contracts` · `deployment` · `sessions`
+
+### Closed types
+
+`story` · `constraint` · `adr` · `contract` · `runbook` · `checkpoint`
+
+### Verified invariant
+
+If `updated_by` starts with `agent:` and `verified` is `true`, serialization and validation fail (`Agents cannot set verified=true`). Only humans (or deterministic review tooling acting as `human:…`) may mark records verified. Agents should always write `verified: false`.
+
+### Example
+
+```markdown
+---
+schema_version: "0.3"
+key: "adr-004-sqlite-wal-sync"
+namespace: "architecture"
+type: "adr"
+version: 1
+updated_at: "2026-11-17T10:09:00Z"
+updated_by: "agent:cursor-architect"
+status: "active"
+verified: false
+stale_after: "2027-02-17"
+supersedes: null
+tags: ["storage", "concurrency", "sqlite"]
+sources: ["docs/prd-v1.md", "commit:8f9a2c1"]
+---
+
+## Context
+…
+
+## Decision / Specification
+…
+
+## Consequences & Trade-offs
+…
 ```
 
-## Storage & Environment Variables
+---
 
-By default, `mcp-memory` creates project-isolated memory stores inside each project's root directory:
-- **OKF Markdown Files (Human-readable)**: `memory/` folder in project root.
-- **SQLite Database (Hidden index)**: `.mcp_memory/memories.db` in project root.
+## 4. Concurrency & Sync Guarantees
 
-You can customize this behavior using environment variables:
+### 4.1 Strict CAS (`expected_version`)
 
-- `MCP_MEMORY_PROJECT_ROOT`: Project root directory (default: process current working directory `cwd`).
-- `MCP_MEMORY_DB_PATH`: SQLite database file path (default: `.mcp_memory/memories.db` relative to project root).
-- `MCP_MEMORY_DIR`: Directory for Open Knowledge Format (OKF) `.md` files (default: `memory` relative to project root).
+`memory_store` requires optimistic concurrency via `expected_version: int = 0`:
 
-> **Tip:** If you prefer a single global memory store shared across all projects, set `MCP_MEMORY_DB_PATH=~/.mcp_memory/memories.db` and `MCP_MEMORY_DIR=~/.mcp_memory/memory` in your client's MCP configuration.
+| Call | Meaning |
+| :--- | :--- |
+| `expected_version=0` | Create only — fails if `memory/<namespace>/<key>.md` already exists |
+| `expected_version=<current>` | Update — must equal the integer `version` currently on disk; success writes `version = current + 1` |
+
+**Algorithm (per key):**
+
+1. Acquire exclusive `fcntl.flock` on `.mcp_memory/locks/<namespace>_<key>.lock`.
+2. Compare `expected_version` to disk (missing file ⇒ actual `0`).
+3. On mismatch, raise `VersionConflictError` (lock released).
+4. On match, serialize OKF, **atomic write** (temp file in same directory → flush → `os.fsync` → `os.replace`), then upsert SQLite + `file_hashes` in one connection.
+
+**Structured conflict response** (`memory_store` returns a JSON string):
+
+```json
+{
+  "error_code": "VERSION_CONFLICT",
+  "key": "<key>",
+  "expected_version": 1,
+  "actual_version": 2,
+  "current_record": "<full YAML frontmatter + Markdown body on disk>"
+}
+```
+
+Caller should re-read (or use `current_record`), merge, and retry with the new `actual_version`.
+
+### 4.2 Bidirectional SHA-256 hash sync
+
+`file_hashes` tracks `(rel_path, sha256, version, last_synced_at)` for paths like `architecture/adr-004-sqlite-wal-sync.md`.
+
+`reconcile_memory_store()` runs:
+
+- at process startup (`init_db()` then reconcile in `memory_server.py`), and
+- at the start of every `memory_retrieve` and `memory_search` (scoped to the call’s `project_root`).
+
+**Reconciliation:**
+
+1. Scan `memory/**/*.md` (skips `memory/index.md`); SHA-256 each file’s raw UTF-8 bytes.
+2. **Deleted on disk** → remove from `memories` / FTS / `file_hashes`.
+3. **Added or modified** (missing hash or digest mismatch) → parse OKF; invalid YAML / non-conforming frontmatter → structured warning on **stderr**, skip file, do not crash.
+4. Regenerate `memory/index.md` only if at least one add/modify/delete occurred.
+5. Unchanged digests incur no SQLite write for that file.
+
+Human/Git edits ingested this way **do not** go through `expected_version` CAS.
+
+---
+
+## 5. MCP Tool Reference
+
+All tools return `str`. Every tool requires a non-empty `project_root` (absolute path to the active project). Missing `project_root` returns an English error string.
+
+Default namespace for CRUD tools: `"discovery"`.
+
+### `memory_store`
+
+Create or update an OKF v0.3 record under `memory/<namespace>/<key>.md`.
+
+| Parameter | Type | Default | Notes |
+| :--- | :--- | :--- | :--- |
+| `key` | `str` | — | Required. Single-segment kebab-case |
+| `content` | `str` \| `dict` | — | Required. Body text or structured content |
+| `project_root` | `str` | — | Required |
+| `tags` | `list[str]` \| omit | `None` | Stored as YAML list |
+| `namespace` | `str` | `"discovery"` | Closed namespace set |
+| `concept_type` | `str` \| omit | `None` → `"story"` | Maps to frontmatter `type` |
+| `title` | `str` \| omit | — | Optional |
+| `description` | `str` \| omit | — | Optional |
+| `resource` | `str` \| omit | — | Optional URI |
+| `status` | `str` \| omit | `None` → `"active"` | Closed status set |
+| `stale_after` | `str` \| omit | ~90 days ahead | ISO date |
+| `sources` | `list` \| omit | — | Provenance |
+| `usage_window` | `dict` \| omit | — | Accepted for compatibility; unused in v0.3 |
+| `verified` | `bool` \| omit | `false` | Agents must not pass `true` |
+| `generated_by` | `str` \| omit | — | Legacy alias for `updated_by` |
+| `updated_by` | `str` \| omit | `"agent:mcp-memory"` | `agent:…` or `human:…` |
+| `version` | `int` \| omit | — | Ignored for CAS; version comes from disk / `expected_version` |
+| `expected_version` | `int` | `0` | Strict CAS precondition |
+| `supersedes` | `str` \| omit | — | Optional predecessor key |
+| `runtime` / `parameters` / `executor` / `attester` / `computation` | various | — | Accepted for compatibility; unused in v0.3 |
+
+**Success:** confirmation + file path + full OKF payload.  
+**Conflict:** JSON with `error_code: "VERSION_CONFLICT"` (see §4.1).
+
+### `memory_retrieve`
+
+| Parameter | Type | Default |
+| :--- | :--- | :--- |
+| `key` | `str` | — (required) |
+| `project_root` | `str` | — (required) |
+| `namespace` | `str` | `"discovery"` |
+
+Reconciles disk → SQLite first. **Success:** full OKF Markdown (`raw_payload`). **Miss:** not-found English string.
+
+### `memory_search`
+
+| Parameter | Type | Default |
+| :--- | :--- | :--- |
+| `project_root` | `str` | — (required) |
+| `query` | `str` \| omit | `None` (FTS5 / LIKE fallback) |
+| `tags` | `list[str]` \| omit | `None` |
+| `namespace` | `str` \| omit | `None` (all namespaces) |
+| `limit` | `int` | `10` |
+
+Reconciles first. **Success:** numbered summary with key, namespace, tags, `updated_at`, and fenced OKF payload. **Miss:** `"No matching memories found."`
+
+### `memory_delete`
+
+| Parameter | Type | Default |
+| :--- | :--- | :--- |
+| `key` | `str` | — (required) |
+| `project_root` | `str` | — (required) |
+| `namespace` | `str` | `"discovery"` |
+
+Removes the SQLite row and the on-disk `.md` file. Success / not-found English strings.
+
+### `memory_checkpoint_set`
+
+Session-scoped checkpoint at `memory/sessions/<session_id>.md` (`namespace: sessions`, `type: checkpoint`, `key: <session_id>`). Manages per-session lock and internal version bump.
+
+| Parameter | Type | Default |
+| :--- | :--- | :--- |
+| `project_root` | `str` | — (required) |
+| `session_id` | `str` | — (required; kebab-case) |
+| `summary` | `str` | — (required) |
+| `active_keys` | `list[str]` \| omit | `[]` |
+| `next_steps` | `list[str]` \| omit | `[]` |
+
+**Success:** confirmation + OKF payload. Invalid `session_id` → JSON `INVALID_SESSION_ID`. CAS failure → JSON `VERSION_CONFLICT`.
+
+### `memory_checkpoint_get`
+
+| Parameter | Type | Default |
+| :--- | :--- | :--- |
+| `project_root` | `str` | — (required) |
+| `session_id` | `str` | — (required) |
+
+**Hit:** raw OKF Markdown. **Miss:** JSON `null` (string `"null"`). Invalid id → JSON `INVALID_SESSION_ID`.
+
+### Deprecated: `memory_get_last` / `memory_update_last`
+
+Prefer `memory_checkpoint_get` / `memory_checkpoint_set`. Both legacy tools route to `memory/sessions/<session_id>.md` and include a `deprecation_notice` in the response text.
+
+**`memory_get_last`**
+
+| Parameter | Type | Default |
+| :--- | :--- | :--- |
+| `project_root` | `str` | — (required) |
+| `namespace` | `str` | `"discovery"` | Kept for call compatibility; **unused** for routing (storage is always `sessions`) |
+| `session_id` | `str` | `"default"` |
+
+**`memory_update_last`**
+
+| Parameter | Type | Default |
+| :--- | :--- | :--- |
+| `content` | `str` \| `dict` | — (required) |
+| `project_root` | `str` | — (required) |
+| `namespace` | `str` | `"discovery"` | Unused for routing |
+| `summary` | `str` \| omit | `None` |
+| `session_id` | `str` | `"default"` |
+
+Dict `content` may supply `summary`, `active_keys`, and `next_steps`; otherwise content is treated as summary / next-step text.
+
+---
+
+## 6. Downstream Cursor Skills & Testing
+
+### Bundled lifecycle skills
+
+Copied by `--init-project` into the target’s `.cursor/skills/`:
+
+| Skill | Purpose |
+| :--- | :--- |
+| `ingest-artifact` | Distill a PRD, interview, API spec, or runbook into atomic OKF records via `memory_store` (dedupe with `memory_search` first; always `verified: false`) |
+| `log-adr` | Record or supersede architecture decisions in `namespace: architecture`, `type: adr`, with Context / Decision / Consequences body sections and CAS updates |
+| `triage-stale-memory` | HITL review of records that are past `stale_after` or `verified: false` (excludes `memory/sessions/`); wait for human confirmation before verify / refresh / deprecate |
+
+The always-on rule `memory-protocol.mdc` requires reading `memory/index.md`, searching before design/code, strict CAS on updates, and session-scoped checkpoints.
+
+### Test suite
+
+```bash
+.venv/bin/python -W default -m pytest -v
+```
+
+Covers OKF v0.3 schema, CAS concurrency, bidirectional hash sync, session scoping, and project init scaffolding (`tests/`). Runtime deps plus `pytest` are listed in `requirements.txt`.
