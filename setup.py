@@ -8,6 +8,15 @@ import shutil
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent.resolve()
+TEMPLATES_DIR = PROJECT_DIR / "templates"
+MEMORY_NAMESPACES = (
+    "discovery",
+    "architecture",
+    "contracts",
+    "deployment",
+    "sessions",
+)
+VALIDATE_HOOK_SNIPPET = "python3 scripts/validate_memory.py"
 
 TOOL_MAP = {
     "1": ("Google Antigravity (~/.gemini/antigravity)", Path("~/.gemini/antigravity/mcp_config.json")),
@@ -19,6 +28,97 @@ TOOL_MAP = {
     "7": ("Codex CLI", None),
     "8": ("Auto-detect & Configure All Installed Tools", None),
 }
+
+
+def _copy_file(src: Path, dest: Path, force: bool) -> str:
+    """Copy src → dest. Returns 'copied', 'overwritten', or 'skipped'."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and not force:
+        return "skipped"
+    existed = dest.exists()
+    shutil.copy2(src, dest)
+    return "overwritten" if existed else "copied"
+
+
+def _install_pre_commit_hook(hooks_dir: Path, force: bool) -> str:
+    """Ensure pre-commit invokes validate_memory.py. Returns status string."""
+    hook_path = hooks_dir / "pre-commit"
+    call_line = VALIDATE_HOOK_SNIPPET
+
+    if not hook_path.exists():
+        content = (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"{call_line}\n"
+        )
+        hook_path.write_text(content, encoding="utf-8")
+        hook_path.chmod(0o755)
+        return "created"
+
+    existing = hook_path.read_text(encoding="utf-8")
+    if call_line in existing:
+        return "unchanged"
+
+    if not existing.endswith("\n"):
+        existing += "\n"
+    hook_path.write_text(existing + f"{call_line}\n", encoding="utf-8")
+    hook_path.chmod(0o755)
+    return "appended"
+
+
+def init_project(target_dir: Path, force: bool = False) -> dict:
+    """
+    Scaffold OKF v0.3 memory protocol, skills, validator, and memory dirs
+    into an existing project directory.
+    """
+    target_dir = target_dir.expanduser().resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    results: dict = {"copied": [], "skipped": [], "created": [], "hook": None}
+
+    # 1. memory-protocol rule
+    src_rule = TEMPLATES_DIR / ".cursor" / "rules" / "memory-protocol.mdc"
+    dest_rule = target_dir / ".cursor" / "rules" / "memory-protocol.mdc"
+    status = _copy_file(src_rule, dest_rule, force)
+    results["copied" if status != "skipped" else "skipped"].append(str(dest_rule))
+
+    # 2. Cursor skills
+    src_skills = TEMPLATES_DIR / ".cursor" / "skills"
+    dest_skills_root = target_dir / ".cursor" / "skills"
+    if src_skills.is_dir():
+        for skill_md in sorted(src_skills.glob("*/SKILL.md")):
+            rel = skill_md.relative_to(src_skills)
+            dest = dest_skills_root / rel
+            status = _copy_file(skill_md, dest, force)
+            results["copied" if status != "skipped" else "skipped"].append(str(dest))
+
+    # 3. validate_memory.py
+    src_script = TEMPLATES_DIR / "scripts" / "validate_memory.py"
+    dest_script = target_dir / "scripts" / "validate_memory.py"
+    status = _copy_file(src_script, dest_script, force)
+    if status != "skipped":
+        dest_script.chmod(0o755)
+        results["copied"].append(str(dest_script))
+    else:
+        results["skipped"].append(str(dest_script))
+
+    # 4. memory namespace directories + .gitkeep
+    for ns in MEMORY_NAMESPACES:
+        ns_dir = target_dir / "memory" / ns
+        ns_dir.mkdir(parents=True, exist_ok=True)
+        gitkeep = ns_dir / ".gitkeep"
+        if not gitkeep.exists() or force:
+            gitkeep.write_text("", encoding="utf-8")
+            results["created"].append(str(gitkeep))
+        else:
+            results["skipped"].append(str(gitkeep))
+
+    # 5. pre-commit hook when .git/hooks exists
+    hooks_dir = target_dir / ".git" / "hooks"
+    if hooks_dir.is_dir():
+        results["hook"] = _install_pre_commit_hook(hooks_dir, force)
+
+    return results
+
 
 def print_banner():
     print("==================================================")
@@ -168,7 +268,31 @@ def main():
     parser.add_argument("--tool", help="Target tool choice (1: Antigravity, 2: Claude Desktop, 3: Claude CLI, 4: Cursor, 5: Windsurf, 6: Codex Desktop, 7: Codex CLI, 8: All)")
     parser.add_argument("--no-config-edit", action="store_true", help="Skip editing tool JSON configuration files")
     parser.add_argument("--non-interactive", action="store_true", help="Run in non-interactive mode using defaults")
+    parser.add_argument(
+        "--init-project",
+        metavar="TARGET_DIR",
+        help="Non-interactively scaffold OKF v0.3 memory protocol, skills, validator, and memory/ dirs into TARGET_DIR",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing files when used with --init-project",
+    )
     args = parser.parse_args()
+
+    if args.init_project:
+        target = Path(args.init_project)
+        results = init_project(target, force=args.force)
+        print(f"Initialized project memory scaffold in: {target.resolve()}")
+        for path in results["copied"]:
+            print(f"  + {path}")
+        for path in results["created"]:
+            print(f"  + {path}")
+        for path in results["skipped"]:
+            print(f"  ~ skipped (exists): {path}")
+        if results["hook"]:
+            print(f"  pre-commit hook: {results['hook']}")
+        return
 
     if not args.non_interactive:
         print_banner()
