@@ -14,6 +14,7 @@ from db import (
     VersionConflictError,
     delete_memory,
     init_db,
+    reconcile_memory_store,
     retrieve_memory,
     search_memories,
     store_memory,
@@ -30,8 +31,9 @@ MCP-Memory Agent Continuity Protocol:
 
 mcp = FastMCP("MCP-Memory", instructions=SERVER_INSTRUCTIONS)
 
-# Initialize database on startup
+# Initialize database and reconcile on-disk HITL edits at startup (Spec 03).
 init_db()
+reconcile_memory_store()
 
 
 @mcp.tool()
@@ -231,6 +233,7 @@ def memory_retrieve(
         return "Error: 'project_root' is required. Please provide the absolute path to your active project root directory."
 
     try:
+        reconcile_memory_store(project_root=project_root)
         record = retrieve_memory(key=key, namespace=namespace, project_root=project_root)
         if not record:
             return f"Memory record with key '{key}' not found in namespace '{namespace}'."
@@ -261,6 +264,7 @@ def memory_search(
         return "Error: 'project_root' is required. Please provide the absolute path to your active project root directory."
 
     try:
+        reconcile_memory_store(project_root=project_root)
         results = search_memories(query=query, tags=tags, namespace=namespace, limit=limit, project_root=project_root)
         if not results:
             return "No matching memories found."

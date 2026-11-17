@@ -5,11 +5,12 @@ Serializes, parses, and validates memory records according to OKF v0.3
 """
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 import re
 import tempfile
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import yaml
 
 SCHEMA_VERSION = "0.3"
@@ -529,6 +530,57 @@ def _atomic_write_text(file_path: str, content: str) -> None:
                 os.unlink(tmp_name)
             except OSError:
                 pass
+
+
+def compute_file_sha256(file_path: str) -> str:
+    """Return the SHA-256 hex digest of a file's raw UTF-8 bytes."""
+    with open(file_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def compute_payload_sha256(payload: str) -> str:
+    """Return the SHA-256 hex digest of a UTF-8 string payload."""
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def memory_rel_path(namespace: str, key: str) -> str:
+    """Canonical relative path under the memory bundle: ``<namespace>/<key>.md``."""
+    clean_key = _validate_key(key)
+    clean_namespace = _validate_namespace(namespace)
+    return f"{clean_namespace}/{clean_key}.md"
+
+
+def iter_memory_markdown_files(base_dir: str) -> Iterator[Tuple[str, str]]:
+    """Yield ``(rel_path, abs_path)`` for ``memory/**/*.md``, skipping index/log.
+
+    ``rel_path`` is relative to ``base_dir`` using forward slashes
+    (e.g. ``architecture/adr-004-sqlite-wal-sync.md``).
+    """
+    if not os.path.isdir(base_dir):
+        return
+    base_abs = os.path.abspath(base_dir)
+    for root, _dirs, files in os.walk(base_abs):
+        for name in files:
+            if not name.endswith(".md"):
+                continue
+            if name in ("index.md", "log.md"):
+                continue
+            abs_path = os.path.join(root, name)
+            rel = os.path.relpath(abs_path, base_abs).replace(os.sep, "/")
+            yield rel, abs_path
+
+
+def regenerate_memory_indexes(base_dir: str) -> None:
+    """Rewrite ``index.md`` for the bundle root and every namespace subdirectory."""
+    if not os.path.isdir(base_dir):
+        return
+    update_directory_index(base_dir, is_bundle_root=True)
+    for entry in sorted(os.listdir(base_dir)):
+        if entry.startswith(".") or entry in ("index.md", "log.md"):
+            continue
+        full = os.path.join(base_dir, entry)
+        if os.path.isdir(full):
+            update_directory_index(full, is_bundle_root=False)
 
 
 def sync_memory_to_disk(

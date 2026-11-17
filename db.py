@@ -9,15 +9,22 @@ import fcntl
 import json
 import os
 import sqlite3
-from typing import Any, Dict, Iterator, List, Optional, Union
+import sys
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from okf_engine import (
     DEFAULT_NAMESPACE,
+    compute_file_sha256,
+    compute_payload_sha256,
     get_memory_file_path,
+    iter_memory_markdown_files,
+    memory_rel_path,
     parse_okf,
+    regenerate_memory_indexes,
     remove_memory_from_disk,
     serialize_okf,
     sync_memory_to_disk,
+    validate_okf_conformance,
 )
 
 from pathlib import Path
@@ -217,7 +224,54 @@ def init_db(db_path: Optional[str] = None) -> None:
             """
         )
 
+        # Spec 03: track on-disk SHA-256 digests for bidirectional HITL sync.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                rel_path TEXT PRIMARY KEY,
+                sha256 TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                last_synced_at TEXT NOT NULL
+            );
+            """
+        )
+
         conn.commit()
+
+
+def _upsert_file_hash(
+    cursor: sqlite3.Cursor,
+    rel_path: str,
+    sha256: str,
+    version: int,
+    last_synced_at: str,
+) -> None:
+    cursor.execute(
+        """
+        INSERT INTO file_hashes (rel_path, sha256, version, last_synced_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(rel_path) DO UPDATE SET
+            sha256 = excluded.sha256,
+            version = excluded.version,
+            last_synced_at = excluded.last_synced_at
+        """,
+        (rel_path, sha256, version, last_synced_at),
+    )
+
+
+def _delete_file_hash(cursor: sqlite3.Cursor, rel_path: str) -> None:
+    cursor.execute("DELETE FROM file_hashes WHERE rel_path = ?", (rel_path,))
+
+
+def _emit_reconcile_warning(rel_path: str, message: str, errors: Optional[List[str]] = None) -> None:
+    payload = {
+        "level": "warning",
+        "error_code": "RECONCILE_SKIP",
+        "rel_path": rel_path,
+        "message": message,
+        "errors": errors or [],
+    }
+    print(json.dumps(payload, sort_keys=True), file=sys.stderr)
 
 
 def store_memory(
@@ -349,6 +403,17 @@ def store_memory(
                     updated_at = excluded.updated_at
                 """,
                 (key, namespace, okf_payload, tags_json, created_at, now_iso),
+            )
+
+            # Keep file_hashes in the same transaction as the memories upsert.
+            rel_path = memory_rel_path(namespace, key)
+            digest = compute_payload_sha256(okf_payload)
+            _upsert_file_hash(
+                cursor,
+                rel_path=rel_path,
+                sha256=digest,
+                version=cas_version,
+                last_synced_at=now_iso,
             )
 
     return {
@@ -495,16 +560,174 @@ def delete_memory(
     get_memory_file_path(key=key, namespace=namespace, base_dir=target_dir)
 
     init_db(target_path)
+    rel_path = memory_rel_path(namespace, key)
     with get_connection(target_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "DELETE FROM memories WHERE key = ? AND namespace = ?",
             (key, namespace),
         )
-        conn.commit()
         deleted = cursor.rowcount > 0
+        if deleted:
+            _delete_file_hash(cursor, rel_path)
 
     if deleted:
         remove_memory_from_disk(key=key, namespace=namespace, base_dir=target_dir)
 
     return deleted
+
+
+def _key_namespace_from_rel_path(rel_path: str) -> Optional[Tuple[str, str]]:
+    """Parse ``namespace/key.md`` into ``(namespace, key)``; return None if invalid."""
+    normalized = rel_path.replace("\\", "/").strip("/")
+    parts = [p for p in normalized.split("/") if p]
+    if len(parts) != 2 or not parts[1].endswith(".md"):
+        return None
+    namespace = parts[0]
+    key = parts[1][:-3]
+    return namespace, key
+
+
+def reconcile_memory_store(
+    project_root: Optional[str] = None,
+    db_path: Optional[str] = None,
+    memories_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Synchronize SQLite (+ FTS5) with on-disk ``memory/**/*.md`` via SHA-256 digests.
+
+    Disk is the canonical HITL source: added/modified files are upserted without
+    CAS checks. Invalid YAML / non-conforming OKF files are skipped with a
+    structured stderr warning. ``memory/index.md`` is regenerated only when at
+    least one add, modify, or delete occurred.
+    """
+    target_path = (
+        db_path if db_path is not None else get_default_db_path(override_root=project_root)
+    )
+    target_dir = (
+        memories_dir
+        if memories_dir is not None
+        else get_default_memories_dir(override_root=project_root)
+    )
+
+    init_db(target_path)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    disk_files = list(iter_memory_markdown_files(target_dir))
+    disk_by_rel = {rel: abs_path for rel, abs_path in disk_files}
+    disk_hashes: Dict[str, str] = {}
+    for rel, abs_path in disk_files:
+        try:
+            disk_hashes[rel] = compute_file_sha256(abs_path)
+        except OSError as exc:
+            _emit_reconcile_warning(rel, f"Failed to read file for hashing: {exc}")
+
+    added = 0
+    modified = 0
+    deleted = 0
+    skipped = 0
+
+    with get_connection(target_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT rel_path, sha256 FROM file_hashes")
+        db_hashes = {row["rel_path"]: row["sha256"] for row in cursor.fetchall()}
+
+        # Deleted on disk: present in SQLite hashes, missing from disk.
+        for rel_path in list(db_hashes.keys()):
+            if rel_path in disk_hashes:
+                continue
+            parsed_ids = _key_namespace_from_rel_path(rel_path)
+            if parsed_ids is not None:
+                namespace, key = parsed_ids
+                cursor.execute(
+                    "DELETE FROM memories WHERE key = ? AND namespace = ?",
+                    (key, namespace),
+                )
+            _delete_file_hash(cursor, rel_path)
+            deleted += 1
+
+        # Added or modified on disk.
+        for rel_path, digest in disk_hashes.items():
+            db_digest = db_hashes.get(rel_path)
+            if db_digest is not None and db_digest == digest:
+                continue
+
+            abs_path = disk_by_rel[rel_path]
+            try:
+                with open(abs_path, "r", encoding="utf-8") as f:
+                    raw_payload = f.read()
+            except OSError as exc:
+                _emit_reconcile_warning(rel_path, f"Failed to read file: {exc}")
+                skipped += 1
+                continue
+
+            validation = validate_okf_conformance(raw_payload, file_path=abs_path)
+            if not validation["valid"]:
+                _emit_reconcile_warning(
+                    rel_path,
+                    "Invalid YAML or missing required OKF v0.3 fields; skipping",
+                    errors=list(validation["errors"]),
+                )
+                skipped += 1
+                continue
+
+            try:
+                parsed = parse_okf(raw_payload)
+            except ValueError as exc:
+                _emit_reconcile_warning(
+                    rel_path,
+                    f"Failed to parse OKF document; skipping: {exc}",
+                )
+                skipped += 1
+                continue
+
+            fm = parsed["frontmatter"]
+            key = str(fm["key"])
+            namespace = str(fm["namespace"])
+            version = int(fm["version"])
+            tags_list = list(parsed.get("tags") or [])
+            tags_json = json.dumps(tags_list)
+            updated_at = str(fm.get("updated_at") or now_iso)
+
+            cursor.execute(
+                "SELECT created_at FROM memories WHERE key = ? AND namespace = ?",
+                (key, namespace),
+            )
+            row = cursor.fetchone()
+            created_at = row["created_at"] if row else now_iso
+
+            cursor.execute(
+                """
+                INSERT INTO memories (key, namespace, okf_payload, tags, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key, namespace) DO UPDATE SET
+                    okf_payload = excluded.okf_payload,
+                    tags = excluded.tags,
+                    updated_at = excluded.updated_at
+                """,
+                (key, namespace, raw_payload, tags_json, created_at, updated_at),
+            )
+            _upsert_file_hash(
+                cursor,
+                rel_path=rel_path,
+                sha256=digest,
+                version=version,
+                last_synced_at=now_iso,
+            )
+
+            if db_digest is None:
+                added += 1
+            else:
+                modified += 1
+
+    changed = (added + modified + deleted) > 0
+    if changed:
+        regenerate_memory_indexes(target_dir)
+
+    return {
+        "added": added,
+        "modified": modified,
+        "deleted": deleted,
+        "skipped": skipped,
+        "changed": changed,
+    }
