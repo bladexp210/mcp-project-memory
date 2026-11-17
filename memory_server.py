@@ -4,12 +4,20 @@ Exposes MCP tools for persistent agent memory backed by OKF v0.3 and SQLite.
 Includes 'Last Memory' checkpoint protocol for cross-session continuity.
 """
 
+import json
 import warnings
 warnings.filterwarnings("ignore")
 
 from typing import Any, Dict, List, Optional, Union
 from mcp.server.fastmcp import FastMCP
-from db import delete_memory, init_db, retrieve_memory, search_memories, store_memory
+from db import (
+    VersionConflictError,
+    delete_memory,
+    init_db,
+    retrieve_memory,
+    search_memories,
+    store_memory,
+)
 from okf_engine import DEFAULT_NAMESPACE
 
 LAST_MEMORY_KEY = "last-memory"
@@ -78,6 +86,15 @@ def memory_update_last(
         return "Error: 'project_root' is required. Please provide the absolute path to your active project root directory."
 
     try:
+        existing = retrieve_memory(
+            key=LAST_MEMORY_KEY,
+            namespace=namespace,
+            project_root=project_root,
+        )
+        expected_version = 0
+        if existing is not None:
+            expected_version = int(existing["frontmatter"]["version"])
+
         record = store_memory(
             key=LAST_MEMORY_KEY,
             content=content,
@@ -89,6 +106,7 @@ def memory_update_last(
             status="active",
             updated_by="agent:mcp-memory",
             verified=False,
+            expected_version=expected_version,
             project_root=project_root,
         )
         return (
@@ -96,6 +114,8 @@ def memory_update_last(
             f"File synced to: {record.get('file_path')}\n\n"
             f"OKF Record Payload:\n{record['okf_payload']}"
         )
+    except VersionConflictError as e:
+        return json.dumps(e.to_dict())
     except Exception as e:
         return f"Error updating last memory checkpoint: {str(e)}"
 
@@ -119,6 +139,7 @@ def memory_store(
     generated_by: Optional[str] = None,
     updated_by: Optional[str] = None,
     version: Optional[int] = None,
+    expected_version: int = 0,
     supersedes: Optional[str] = None,
     runtime: Optional[str] = None,
     parameters: Optional[List[Dict[str, Any]]] = None,
@@ -146,7 +167,8 @@ def memory_store(
         verified: Boolean verification flag. Agents must not set true.
         generated_by: Legacy alias for updated_by.
         updated_by: Actor 'agent:<id>' or 'human:<username>'.
-        version: Integer >= 1 (default 1 for new records).
+        version: Unused for CAS; version is assigned from expected_version / disk.
+        expected_version: CAS precondition. 0 = create only; >=1 must match disk version.
         supersedes: Optional key of the replaced record.
         runtime/parameters/executor/attester/computation: Unused in OKF v0.3 (accepted for call compatibility).
     """
@@ -171,6 +193,7 @@ def memory_store(
             generated_by=generated_by,
             updated_by=updated_by,
             version=version,
+            expected_version=expected_version,
             supersedes=supersedes,
             runtime=runtime,
             parameters=parameters,
@@ -184,6 +207,8 @@ def memory_store(
             f"File synced to: {record.get('file_path')}\n\n"
             f"OKF Record Payload:\n{record['okf_payload']}"
         )
+    except VersionConflictError as e:
+        return json.dumps(e.to_dict())
     except Exception as e:
         return f"Error storing memory: {str(e)}"
 

@@ -3,11 +3,13 @@ Database layer for MCP-Memory server.
 Handles SQLite operations, schema initialization, and FTS5 full-text indexing.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 import sqlite3
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from okf_engine import (
     DEFAULT_NAMESPACE,
@@ -21,6 +23,37 @@ from okf_engine import (
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.resolve()
+
+
+class VersionConflictError(Exception):
+    """Raised when a CAS write's expected_version does not match disk."""
+
+    error_code = "VERSION_CONFLICT"
+
+    def __init__(
+        self,
+        key: str,
+        expected: int,
+        actual: int,
+        current_record: Optional[str] = None,
+    ) -> None:
+        self.key = key
+        self.expected_version = expected
+        self.actual_version = actual
+        self.current_record = current_record if current_record is not None else ""
+        super().__init__(
+            f"VERSION_CONFLICT for key '{key}': expected_version={expected}, "
+            f"actual_version={actual}"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error_code": self.error_code,
+            "key": self.key,
+            "expected_version": self.expected_version,
+            "actual_version": self.actual_version,
+            "current_record": self.current_record,
+        }
 
 def get_project_root() -> Path:
     """Returns the project root directory, or falls back to user home if cwd is root '/' or unwritable."""
@@ -69,7 +102,9 @@ DEFAULT_DB_PATH = get_default_db_path()
 DEFAULT_MEMORIES_DIR = get_default_memories_dir()
 
 
-def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+@contextmanager
+def get_connection(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+    """Open a SQLite connection with WAL + busy_timeout, closing it on exit."""
     target_path = db_path if db_path is not None else get_default_db_path()
     abs_path = os.path.abspath(os.path.expanduser(target_path))
     parent_dir = os.path.dirname(abs_path)
@@ -77,7 +112,49 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
         os.makedirs(parent_dir, exist_ok=True)
     conn = sqlite3.connect(abs_path)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _locks_dir(
+    project_root: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Path:
+    if project_root:
+        return Path(project_root).expanduser().resolve() / ".mcp_memory" / "locks"
+    if db_path is not None:
+        return Path(db_path).expanduser().resolve().parent / "locks"
+    return Path(get_default_db_path()).resolve().parent / "locks"
+
+
+def _lock_file_path(
+    namespace: str,
+    key: str,
+    project_root: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Path:
+    locks = _locks_dir(project_root=project_root, db_path=db_path)
+    locks.mkdir(parents=True, exist_ok=True)
+    return locks / f"{namespace}_{key}.lock"
+
+
+@contextmanager
+def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def init_db(db_path: Optional[str] = None) -> None:
@@ -85,9 +162,6 @@ def init_db(db_path: Optional[str] = None) -> None:
     target_path = db_path if db_path is not None else get_default_db_path()
     with get_connection(target_path) as conn:
         cursor = conn.cursor()
-        
-        # Enable WAL mode for performance
-        cursor.execute("PRAGMA journal_mode=WAL;")
 
         cursor.execute(
             """
@@ -163,6 +237,7 @@ def store_memory(
     generated_by: Optional[str] = None,
     updated_by: Optional[str] = None,
     version: Optional[int] = None,
+    expected_version: int = 0,
     supersedes: Optional[str] = None,
     runtime: Optional[str] = None,
     parameters: Optional[List[Dict[str, Any]]] = None,
@@ -173,73 +248,108 @@ def store_memory(
     memories_dir: Optional[str] = None,
     project_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Store or update a memory record in SQLite formatted as OKF v0.3 and sync to disk .md file."""
+    """Store or update a memory record with strict CAS (expected_version)."""
     target_path = db_path if db_path is not None else get_default_db_path(override_root=project_root)
     target_dir = memories_dir if memories_dir is not None else get_default_memories_dir(override_root=project_root)
 
     # Resolve the destination before touching SQLite so a key or namespace that
     # cannot be written raises here rather than after the row is committed.
-    # sync_memory_to_disk recomputes the same path; this call is for the check.
-    get_memory_file_path(key=key, namespace=namespace, base_dir=target_dir)
+    file_path = get_memory_file_path(key=key, namespace=namespace, base_dir=target_dir)
 
     init_db(target_path)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tags_list = tags if tags is not None else []
     tags_json = json.dumps(tags_list)
+    lock_path = _lock_file_path(
+        namespace=namespace,
+        key=key,
+        project_root=project_root,
+        db_path=target_path,
+    )
 
-    with get_connection(target_path) as conn:
-        cursor = conn.cursor()
-        
-        # Check existing record to preserve created_at
-        cursor.execute(
-            "SELECT created_at FROM memories WHERE key = ? AND namespace = ?",
-            (key, namespace),
-        )
-        row = cursor.fetchone()
-        created_at = row["created_at"] if row else now_iso
+    with _exclusive_file_lock(lock_path):
+        current_record: Optional[str] = None
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as existing_file:
+                current_record = existing_file.read()
+            actual_version = int(parse_okf(current_record)["frontmatter"]["version"])
+            if expected_version != actual_version:
+                raise VersionConflictError(
+                    key=key,
+                    expected=expected_version,
+                    actual=actual_version,
+                    current_record=current_record,
+                )
+            next_version = actual_version + 1
+        else:
+            if expected_version != 0:
+                raise VersionConflictError(
+                    key=key,
+                    expected=expected_version,
+                    actual=0,
+                    current_record="",
+                )
+            next_version = 1
 
-        okf_payload = serialize_okf(
-            key=key,
-            content=content,
-            tags=tags_list,
-            namespace=namespace,
-            concept_type=concept_type,
-            title=title,
-            description=description,
-            resource=resource,
-            status=status,
-            stale_after=stale_after,
-            sources=sources,
-            usage_window=usage_window,
-            verified=verified,
-            generated_by=generated_by,
-            updated_by=updated_by,
-            version=version,
-            supersedes=supersedes,
-            runtime=runtime,
-            parameters=parameters,
-            executor=executor,
-            attester=attester,
-            computation=computation,
-            created_at=created_at,
-            updated_at=now_iso,
-        )
+        # Caller-supplied `version` cannot bypass CAS; disk/CAS decides the value.
+        _ = version
+        cas_version = next_version
 
-        cursor.execute(
-            """
-            INSERT INTO memories (key, namespace, okf_payload, tags, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(key, namespace) DO UPDATE SET
-                okf_payload = excluded.okf_payload,
-                tags = excluded.tags,
-                updated_at = excluded.updated_at
-            """,
-            (key, namespace, okf_payload, tags_json, created_at, now_iso),
-        )
-        conn.commit()
+        with get_connection(target_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT created_at FROM memories WHERE key = ? AND namespace = ?",
+                (key, namespace),
+            )
+            row = cursor.fetchone()
+            created_at = row["created_at"] if row else now_iso
 
-    # Sync OKF Markdown file to disk
-    file_path = sync_memory_to_disk(key=key, namespace=namespace, okf_payload=okf_payload, base_dir=target_dir)
+            okf_payload = serialize_okf(
+                key=key,
+                content=content,
+                tags=tags_list,
+                namespace=namespace,
+                concept_type=concept_type,
+                title=title,
+                description=description,
+                resource=resource,
+                status=status,
+                stale_after=stale_after,
+                sources=sources,
+                usage_window=usage_window,
+                verified=verified,
+                generated_by=generated_by,
+                updated_by=updated_by,
+                version=cas_version,
+                supersedes=supersedes,
+                runtime=runtime,
+                parameters=parameters,
+                executor=executor,
+                attester=attester,
+                computation=computation,
+                created_at=created_at,
+                updated_at=now_iso,
+            )
+
+            # Atomic markdown write first, then SQLite (Spec 02 order).
+            synced_path = sync_memory_to_disk(
+                key=key,
+                namespace=namespace,
+                okf_payload=okf_payload,
+                base_dir=target_dir,
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO memories (key, namespace, okf_payload, tags, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key, namespace) DO UPDATE SET
+                    okf_payload = excluded.okf_payload,
+                    tags = excluded.tags,
+                    updated_at = excluded.updated_at
+                """,
+                (key, namespace, okf_payload, tags_json, created_at, now_iso),
+            )
 
     return {
         "key": key,
@@ -248,7 +358,7 @@ def store_memory(
         "created_at": created_at,
         "updated_at": now_iso,
         "okf_payload": okf_payload,
-        "file_path": file_path,
+        "file_path": synced_path,
     }
 
 

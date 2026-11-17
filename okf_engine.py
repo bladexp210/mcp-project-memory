@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
+import tempfile
 from typing import Any, Dict, List, Optional, Union
 import yaml
 
@@ -439,8 +440,7 @@ def update_directory_index(dir_path: str, is_bundle_root: bool = False) -> None:
 
     index_content = "\n".join(lines).strip() + "\n"
     index_file = os.path.join(dir_path, "index.md")
-    with open(index_file, "w", encoding="utf-8") as f:
-        f.write(index_content)
+    _atomic_write_text(index_file, index_content)
 
 
 def append_log_entry(
@@ -464,8 +464,7 @@ def append_log_entry(
 
     if not os.path.exists(log_file):
         content = f"# Directory Update Log\n\n## {today}\n{log_bullet}\n"
-        with open(log_file, "w", encoding="utf-8") as f:
-            f.write(content)
+        _atomic_write_text(log_file, content)
         return
 
     try:
@@ -501,8 +500,35 @@ def append_log_entry(
                 f"# Directory Update Log\n\n## {today}\n{log_bullet}\n\n{existing}"
             )
 
-    with open(log_file, "w", encoding="utf-8") as f:
-        f.write(updated_content)
+    _atomic_write_text(log_file, updated_content)
+
+
+def _atomic_write_text(file_path: str, content: str) -> None:
+    """Write text atomically via temp file in the same directory + fsync + replace."""
+    parent_dir = os.path.dirname(file_path) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+    tmp_name: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent_dir,
+            prefix=f".{os.path.basename(file_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_name = tmp.name
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, file_path)
+        tmp_name = None
+    finally:
+        if tmp_name is not None and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def sync_memory_to_disk(
@@ -516,8 +542,7 @@ def sync_memory_to_disk(
     parent_dir = os.path.dirname(file_path)
     os.makedirs(parent_dir, exist_ok=True)
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(okf_payload)
+    _atomic_write_text(file_path, okf_payload)
 
     curr = parent_dir
     base_abs = os.path.abspath(base_dir)
