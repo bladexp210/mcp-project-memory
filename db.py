@@ -10,6 +10,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional, Union
 
 from okf_engine import (
+    DEFAULT_NAMESPACE,
     get_memory_file_path,
     parse_okf,
     remove_memory_from_disk,
@@ -92,7 +93,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             """
             CREATE TABLE IF NOT EXISTS memories (
                 key TEXT NOT NULL,
-                namespace TEXT NOT NULL DEFAULT 'default',
+                namespace TEXT NOT NULL DEFAULT 'discovery',
                 okf_payload TEXT NOT NULL,
                 tags TEXT NOT NULL DEFAULT '[]',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -149,17 +150,20 @@ def store_memory(
     key: str,
     content: Union[str, Dict[str, Any]],
     tags: Optional[List[str]] = None,
-    namespace: str = "default",
+    namespace: str = DEFAULT_NAMESPACE,
     concept_type: Optional[str] = None,
     title: Optional[str] = None,
     description: Optional[str] = None,
     resource: Optional[str] = None,
     status: Optional[str] = None,
     stale_after: Optional[str] = None,
-    sources: Optional[List[Dict[str, Any]]] = None,
+    sources: Optional[List[Any]] = None,
     usage_window: Optional[Dict[str, str]] = None,
-    verified: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+    verified: Optional[bool] = None,
     generated_by: Optional[str] = None,
+    updated_by: Optional[str] = None,
+    version: Optional[int] = None,
+    supersedes: Optional[str] = None,
     runtime: Optional[str] = None,
     parameters: Optional[List[Dict[str, Any]]] = None,
     executor: Optional[Dict[str, Any]] = None,
@@ -169,7 +173,7 @@ def store_memory(
     memories_dir: Optional[str] = None,
     project_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Store or update a memory record in SQLite formatted as OKF v0.2 and sync to disk .md file."""
+    """Store or update a memory record in SQLite formatted as OKF v0.3 and sync to disk .md file."""
     target_path = db_path if db_path is not None else get_default_db_path(override_root=project_root)
     target_dir = memories_dir if memories_dir is not None else get_default_memories_dir(override_root=project_root)
 
@@ -209,6 +213,9 @@ def store_memory(
             usage_window=usage_window,
             verified=verified,
             generated_by=generated_by,
+            updated_by=updated_by,
+            version=version,
+            supersedes=supersedes,
             runtime=runtime,
             parameters=parameters,
             executor=executor,
@@ -247,7 +254,7 @@ def store_memory(
 
 def retrieve_memory(
     key: str,
-    namespace: str = "default",
+    namespace: str = DEFAULT_NAMESPACE,
     db_path: Optional[str] = None,
     project_root: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -365,7 +372,7 @@ def search_memories(
 
 def delete_memory(
     key: str,
-    namespace: str = "default",
+    namespace: str = DEFAULT_NAMESPACE,
     db_path: Optional[str] = None,
     memories_dir: Optional[str] = None,
     project_root: Optional[str] = None,

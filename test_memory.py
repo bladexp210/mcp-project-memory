@@ -1,6 +1,6 @@
 """
 Unit tests for MCP-Memory server.
-Tests OKF v0.2 spec rules, parsing/serialization, validation, SQLite storage & FTS search, and MCP tools including Last Memory checkpoints.
+Tests OKF v0.3 schema rules, parsing/serialization, validation, SQLite storage & FTS search, and MCP tools including Last Memory checkpoints.
 """
 
 import os
@@ -29,12 +29,11 @@ class TestOKFEngine(unittest.TestCase):
                 get_memory_file_path("..\\..\\etc\\passwd", base_dir=base)
 
     def test_memory_path_rejects_absolute_key(self):
-        """An absolute key must not write outside base_dir."""
+        """An absolute-looking key is invalid under kebab-case rules."""
         with tempfile.TemporaryDirectory() as tmp:
             base = os.path.join(tmp, "memory")
-            path = get_memory_file_path("/tmp/evil.md", base_dir=base)
-            resolved = os.path.realpath(path)
-            self.assertTrue(resolved.startswith(os.path.realpath(base) + os.sep))
+            with self.assertRaises(ValueError):
+                get_memory_file_path("/tmp/evil.md", base_dir=base)
 
     def test_memory_path_rejects_empty_key(self):
         """Empty keys must raise."""
@@ -45,34 +44,47 @@ class TestOKFEngine(unittest.TestCase):
                     get_memory_file_path(bad, base_dir=base)
 
     def test_memory_path_rejects_traversal_in_namespace(self):
-        """Namespaces with traversal tokens or multiple segments must raise."""
+        """Namespaces with traversal tokens, multi-segment paths, or non-closed values must raise."""
         with tempfile.TemporaryDirectory() as tmp:
             base = os.path.join(tmp, "memory")
-            for bad_ns in ("../evil", "a/b", "work/../x", ".."):
+            for bad_ns in ("../evil", "a/b", "work/../x", "..", "default"):
                 with self.assertRaises(ValueError, msg=f"namespace {bad_ns!r} should raise"):
-                    get_memory_file_path("key.md", namespace=bad_ns, base_dir=base)
+                    get_memory_file_path("plain-key", namespace=bad_ns, base_dir=base)
 
     def test_memory_path_normal_key_still_works(self):
-        """Normal keys keep working: namespaced paths inside base_dir."""
+        """Kebab-case keys resolve under memory/<namespace>/<key>.md."""
         with tempfile.TemporaryDirectory() as tmp:
             base = os.path.join(tmp, "memory")
-            path = get_memory_file_path("user/preferences/theme", namespace="user_settings", base_dir=base)
-            resolved = os.path.realpath(path)
-            self.assertTrue(resolved.startswith(os.path.realpath(base) + os.sep))
+            path = get_memory_file_path(
+                "story-user-theme",
+                namespace="discovery",
+                base_dir=base,
+            )
+            resolved = os.path.realpath(path) if os.path.exists(os.path.dirname(path)) else os.path.normpath(path)
+            self.assertTrue(resolved.endswith(os.path.join("discovery", "story-user-theme.md")) or resolved.endswith("discovery/story-user-theme.md"))
             self.assertTrue(resolved.endswith(".md"))
-            self.assertIn("user_settings", resolved)
+            self.assertIn("discovery", resolved)
 
     def test_serialize_and_parse_string_content(self):
-        key = "user/preferences/theme"
+        key = "story-user-theme"
         content = "User prefers dark mode with high contrast."
         tags = ["ui", "preferences"]
-        namespace = "user_settings"
+        namespace = "discovery"
 
-        okf_payload = serialize_okf(key=key, content=content, tags=tags, namespace=namespace)
+        okf_payload = serialize_okf(
+            key=key,
+            content=content,
+            tags=tags,
+            namespace=namespace,
+            concept_type="story",
+            stale_after="2027-01-01",
+            sources=[],
+        )
 
-        self.assertIn("type: Agent Memory", okf_payload)
-        self.assertIn("key: user/preferences/theme", okf_payload)
-        self.assertIn("namespace: user_settings", okf_payload)
+        self.assertIn("schema_version: '0.3'", okf_payload.replace('"', "'"))
+        self.assertIn("type: story", okf_payload)
+        self.assertIn("key: story-user-theme", okf_payload)
+        self.assertIn("namespace: discovery", okf_payload)
         self.assertIn("User prefers dark mode with high contrast.", okf_payload)
 
         parsed = parse_okf(okf_payload)
@@ -82,11 +94,19 @@ class TestOKFEngine(unittest.TestCase):
         self.assertEqual(parsed["body"], content)
 
     def test_serialize_and_parse_dict_content(self):
-        key = "project/architecture"
-        content = {"framework": "FastMCP", "db": "SQLite", "okf_version": "0.2"}
-        tags = ["architecture", "tech_stack"]
+        key = "adr-project-architecture"
+        content = {"framework": "FastMCP", "db": "SQLite", "okf_version": "0.3"}
+        tags = ["architecture", "tech-stack"]
 
-        okf_payload = serialize_okf(key=key, content=content, tags=tags)
+        okf_payload = serialize_okf(
+            key=key,
+            content=content,
+            tags=tags,
+            namespace="architecture",
+            concept_type="adr",
+            stale_after="2027-01-01",
+            sources=[],
+        )
         parsed = parse_okf(okf_payload)
 
         self.assertEqual(parsed["key"], key)
@@ -94,25 +114,24 @@ class TestOKFEngine(unittest.TestCase):
         self.assertIn("```json", parsed["body"])
         self.assertIn('"framework": "FastMCP"', parsed["body"])
 
-    def test_okf_v02_extended_serialization(self):
-        key = "metrics/revenue"
+    def test_okf_v03_extended_serialization(self):
+        key = "constraint-revenue-metric"
         content = "Recognized revenue for fiscal year."
-        sources = [
-            {"id": "rev-policy", "resource": "https://wiki.acme/rev", "title": "Revenue Policy"}
-        ]
-        verified = [{"by": "human:ahormati", "at": "2026-08-12T19:00:00Z"}]
-        
+        sources = ["docs/rev-policy.md", "commit:8f9a2c1"]
+
         okf_payload = serialize_okf(
             key=key,
             content=content,
-            concept_type="Metric",
+            namespace="contracts",
+            concept_type="constraint",
             title="Revenue Fiscal Year",
             description="Recognized annual revenue.",
-            status="stable",
+            status="active",
             stale_after="2026-12-31",
             sources=sources,
-            verified=verified,
-            generated_by="agent/gemini-3.6",
+            verified=True,
+            updated_by="human:ahormati",
+            version=1,
         )
 
         validation = validate_okf_conformance(okf_payload)
@@ -120,32 +139,75 @@ class TestOKFEngine(unittest.TestCase):
 
         parsed = parse_okf(okf_payload)
         fm = parsed["frontmatter"]
-        self.assertEqual(fm["type"], "Metric")
+        self.assertEqual(fm["schema_version"], "0.3")
+        self.assertEqual(fm["type"], "constraint")
         self.assertEqual(fm["title"], "Revenue Fiscal Year")
         self.assertEqual(fm["description"], "Recognized annual revenue.")
-        self.assertEqual(fm["status"], "stable")
+        self.assertEqual(fm["status"], "active")
         self.assertEqual(fm["stale_after"], "2026-12-31")
-        self.assertEqual(fm["generated"]["by"], "agent/gemini-3.6")
-        self.assertEqual(fm["sources"][0]["id"], "rev-policy")
-        self.assertEqual(fm["verified"][0]["by"], "human:ahormati")
+        self.assertEqual(fm["updated_by"], "human:ahormati")
+        self.assertEqual(fm["sources"][0], "docs/rev-policy.md")
+        self.assertIs(fm["verified"], True)
+        self.assertEqual(fm["version"], 1)
 
     def test_okf_conformance_validation(self):
         # Valid document
-        valid_doc = serialize_okf(key="test/doc", content="Valid content")
+        valid_doc = serialize_okf(
+            key="story-test-doc",
+            content="Valid content",
+            stale_after="2027-01-01",
+            sources=[],
+        )
         res_valid = validate_okf_conformance(valid_doc)
         self.assertTrue(res_valid["valid"])
 
         # Invalid document (missing type)
-        invalid_yaml = "---\ntitle: Missing Type\nkey: test/doc\n---\nBody text"
+        invalid_yaml = (
+            "---\n"
+            "schema_version: '0.3'\n"
+            "title: Missing Type\n"
+            "key: story-test-doc\n"
+            "namespace: discovery\n"
+            "version: 1\n"
+            "updated_at: '2026-11-17T10:09:00Z'\n"
+            "updated_by: agent:mcp-memory\n"
+            "status: active\n"
+            "verified: false\n"
+            "stale_after: '2027-01-01'\n"
+            "tags: []\n"
+            "sources: []\n"
+            "---\nBody text"
+        )
         res_invalid = validate_okf_conformance(invalid_yaml)
         self.assertFalse(res_invalid["valid"])
-        self.assertIn("Required field 'type' is missing or empty (§11)", res_invalid["errors"][0])
+        self.assertTrue(
+            any("type" in err for err in res_invalid["errors"]),
+            res_invalid["errors"],
+        )
 
-        # Invalid actor format
-        invalid_actor_doc = "---\ntype: Agent Memory\ngenerated: { by: invalidactor, at: 2026-08-12T19:00:00Z }\n---\nContent"
-        res_actor = validate_okf_conformance(invalid_actor_doc)
+        # Agent verified=true rejected
+        invalid_agent_doc = (
+            "---\n"
+            "schema_version: '0.3'\n"
+            "key: story-test-doc\n"
+            "namespace: discovery\n"
+            "type: story\n"
+            "version: 1\n"
+            "updated_at: '2026-11-17T10:09:00Z'\n"
+            "updated_by: agent:mcp-memory\n"
+            "status: active\n"
+            "verified: true\n"
+            "stale_after: '2027-01-01'\n"
+            "tags: []\n"
+            "sources: []\n"
+            "---\nContent"
+        )
+        res_actor = validate_okf_conformance(invalid_agent_doc)
         self.assertFalse(res_actor["valid"])
-        self.assertIn("actor convention", res_actor["errors"][0])
+        self.assertTrue(
+            any("verified" in err.lower() for err in res_actor["errors"]),
+            res_actor["errors"],
+        )
 
 
 class TestDatabaseLayer(unittest.TestCase):
@@ -164,12 +226,20 @@ class TestDatabaseLayer(unittest.TestCase):
         shutil.rmtree(self.temp_memories_dir, ignore_errors=True)
 
     def test_store_and_retrieve(self):
-        key = "test/key1"
+        key = "story-key1"
         content = "Memory test content"
         tags = ["test", "demo"]
-        namespace = "test_ns"
+        namespace = "discovery"
 
-        rec = db.store_memory(key=key, content=content, tags=tags, namespace=namespace, db_path=self.temp_db_path, memories_dir=self.temp_memories_dir)
+        rec = db.store_memory(
+            key=key,
+            content=content,
+            tags=tags,
+            namespace=namespace,
+            concept_type="story",
+            db_path=self.temp_db_path,
+            memories_dir=self.temp_memories_dir,
+        )
         self.assertEqual(rec["key"], key)
         self.assertEqual(rec["namespace"], namespace)
 
@@ -183,39 +253,53 @@ class TestDatabaseLayer(unittest.TestCase):
     def test_file_dumping_and_indexes_and_log(self):
         temp_dir = tempfile.mkdtemp()
         try:
-            key = "user/preferences/theme"
+            key = "story-user-theme"
             content = "User prefers dark mode"
             tags = ["ui"]
-            
-            rec = db.store_memory(key=key, content=content, tags=tags, db_path=self.temp_db_path, memories_dir=temp_dir)
-            expected_file = os.path.join(temp_dir, "user", "preferences", "theme.md")
-            expected_index = os.path.join(temp_dir, "user", "preferences", "index.md")
+            namespace = "discovery"
+
+            rec = db.store_memory(
+                key=key,
+                content=content,
+                tags=tags,
+                namespace=namespace,
+                concept_type="story",
+                db_path=self.temp_db_path,
+                memories_dir=temp_dir,
+            )
+            expected_file = os.path.join(temp_dir, "discovery", "story-user-theme.md")
+            expected_index = os.path.join(temp_dir, "discovery", "index.md")
             root_index = os.path.join(temp_dir, "index.md")
             root_log = os.path.join(temp_dir, "log.md")
 
-            self.assertTrue(os.path.exists(expected_file))
+            self.assertTrue(os.path.exists(expected_file), rec["file_path"])
             self.assertTrue(os.path.exists(expected_index))
             self.assertTrue(os.path.exists(root_index))
             self.assertTrue(os.path.exists(root_log))
 
-            # Verify bundle root index.md contains okf_version: "0.2" (§12)
+            # Verify bundle root index.md contains okf_version: "0.3"
             with open(root_index, "r", encoding="utf-8") as f:
                 root_index_content = f.read()
-                self.assertIn('okf_version: "0.2"', root_index_content)
+                self.assertIn('okf_version: "0.3"', root_index_content)
 
-            # Verify subdirectory index.md does NOT contain frontmatter (§8)
+            # Verify subdirectory index.md does NOT contain frontmatter
             with open(expected_index, "r", encoding="utf-8") as f:
                 sub_index_content = f.read()
                 self.assertNotIn("okf_version", sub_index_content)
 
-            # Verify log.md contains entry (§9)
+            # Verify log.md contains entry
             with open(root_log, "r", encoding="utf-8") as f:
                 log_content = f.read()
                 self.assertIn("# Directory Update Log", log_content)
                 self.assertIn("**Update**", log_content)
 
             # Test deletion removes file and logs deletion
-            deleted = db.delete_memory(key=key, db_path=self.temp_db_path, memories_dir=temp_dir)
+            deleted = db.delete_memory(
+                key=key,
+                namespace=namespace,
+                db_path=self.temp_db_path,
+                memories_dir=temp_dir,
+            )
             self.assertTrue(deleted)
             self.assertFalse(os.path.exists(expected_file))
 
@@ -227,22 +311,49 @@ class TestDatabaseLayer(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_search_fts_and_tags(self):
-        db.store_memory("key/alpha", "Python programming language", tags=["code", "python"], db_path=self.temp_db_path, memories_dir=self.temp_memories_dir)
-        db.store_memory("key/beta", "JavaScript node framework", tags=["code", "js"], db_path=self.temp_db_path, memories_dir=self.temp_memories_dir)
-        db.store_memory("key/gamma", "SQLite database indexing", tags=["db", "sql"], db_path=self.temp_db_path, memories_dir=self.temp_memories_dir)
+        db.store_memory(
+            "story-key-alpha",
+            "Python programming language",
+            tags=["code", "python"],
+            concept_type="story",
+            db_path=self.temp_db_path,
+            memories_dir=self.temp_memories_dir,
+        )
+        db.store_memory(
+            "story-key-beta",
+            "JavaScript node framework",
+            tags=["code", "js"],
+            concept_type="story",
+            db_path=self.temp_db_path,
+            memories_dir=self.temp_memories_dir,
+        )
+        db.store_memory(
+            "story-key-gamma",
+            "SQLite database indexing",
+            tags=["db", "sql"],
+            concept_type="story",
+            db_path=self.temp_db_path,
+            memories_dir=self.temp_memories_dir,
+        )
 
         py_results = db.search_memories(query="Python", db_path=self.temp_db_path)
         self.assertEqual(len(py_results), 1)
-        self.assertEqual(py_results[0]["key"], "key/alpha")
+        self.assertEqual(py_results[0]["key"], "story-key-alpha")
 
         db_results = db.search_memories(tags=["db"], db_path=self.temp_db_path)
         self.assertEqual(len(db_results), 1)
-        self.assertEqual(db_results[0]["key"], "key/gamma")
+        self.assertEqual(db_results[0]["key"], "story-key-gamma")
 
     def test_delete_memory(self):
-        key = "delete/me"
-        db.store_memory(key=key, content="Temporary content", db_path=self.temp_db_path, memories_dir=self.temp_memories_dir)
-        
+        key = "story-delete-me"
+        db.store_memory(
+            key=key,
+            content="Temporary content",
+            concept_type="story",
+            db_path=self.temp_db_path,
+            memories_dir=self.temp_memories_dir,
+        )
+
         retrieved = db.retrieve_memory(key=key, db_path=self.temp_db_path)
         self.assertIsNotNone(retrieved)
 
@@ -253,12 +364,8 @@ class TestDatabaseLayer(unittest.TestCase):
         self.assertIsNone(retrieved_after)
 
     def test_rejected_key_is_not_committed_to_index(self):
-        """A key the path validator rejects must leave no row behind.
-
-        SQLite indexes the .md tree, so a row whose file was never written is
-        readable through retrieve and search while nothing backs it on disk.
-        """
-        for bad in ("../escaped", "a/../b", "..\\..\\etc\\passwd", ""):
+        """A key the path validator rejects must leave no row behind."""
+        for bad in ("../escaped", "a/../b", "..\\..\\etc\\passwd", "", "has_underscore", "UpperCase"):
             with self.subTest(key=bad):
                 with self.assertRaises(ValueError):
                     db.store_memory(
@@ -288,14 +395,14 @@ class TestDatabaseLayer(unittest.TestCase):
         """Namespace validation must gate the write for the same reason."""
         with self.assertRaises(ValueError):
             db.store_memory(
-                key="valid/key",
+                key="story-valid-key",
                 content="should not be persisted",
                 namespace="../evil",
                 db_path=self.temp_db_path,
                 memories_dir=self.temp_memories_dir,
             )
         self.assertIsNone(
-            db.retrieve_memory(key="valid/key", namespace="../evil", db_path=self.temp_db_path)
+            db.retrieve_memory(key="story-valid-key", namespace="../evil", db_path=self.temp_db_path)
         )
 
     def test_delete_keeps_row_when_path_is_rejected(self):
@@ -308,7 +415,7 @@ class TestDatabaseLayer(unittest.TestCase):
             conn.execute(
                 "INSERT INTO memories (key, namespace, okf_payload, tags, created_at, updated_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
-                (bad_key, "default", "---\nkey: ../escaped\n---\n\nlegacy", "[]", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                (bad_key, "discovery", "---\nkey: ../escaped\n---\n\nlegacy", "[]", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
             )
         self.assertIsNotNone(db.retrieve_memory(key=bad_key, db_path=self.temp_db_path))
 
@@ -325,11 +432,12 @@ class TestDatabaseLayer(unittest.TestCase):
 
     def test_valid_key_still_round_trips(self):
         """The guard must not change behaviour for keys that were always fine."""
-        for good in ("plain", "arch/decision", "nested/deep/k.md"):
+        for good in ("plain", "adr-decision", "story-nested-deep-k"):
             with self.subTest(key=good):
                 record = db.store_memory(
                     key=good,
                     content=f"content for {good}",
+                    concept_type="story",
                     db_path=self.temp_db_path,
                     memories_dir=self.temp_memories_dir,
                 )
@@ -357,38 +465,38 @@ class TestMCPTools(unittest.TestCase):
     def test_mcp_tools_flow(self):
         project_root = tempfile.mkdtemp()
         try:
-            # 1. memory_store with OKF v0.2 parameters
+            # 1. memory_store with OKF v0.3 parameters
             res_store = memory_store(
-                key="agent/goal",
+                key="runbook-agent-goal",
                 content="Build MCP Memory Server",
                 tags=["goal", "mcp"],
-                concept_type="Playbook",
+                concept_type="runbook",
                 description="Goal for constructing MCP server",
-                status="stable",
+                status="active",
                 stale_after="2026-12-31",
                 project_root=project_root,
             )
             self.assertIn("Successfully stored memory", res_store)
-            self.assertIn("type: Playbook", res_store)
-            self.assertIn("status: stable", res_store)
+            self.assertIn("type: runbook", res_store)
+            self.assertIn("status: active", res_store)
             self.assertIn("stale_after: '2026-12-31'", res_store)
 
             # 2. memory_retrieve
-            res_retrieve = memory_retrieve(key="agent/goal", project_root=project_root)
-            self.assertIn("type: Playbook", res_retrieve)
+            res_retrieve = memory_retrieve(key="runbook-agent-goal", project_root=project_root)
+            self.assertIn("type: runbook", res_retrieve)
             self.assertIn("Build MCP Memory Server", res_retrieve)
 
             # 3. memory_search
             res_search = memory_search(query="Server", tags=["mcp"], project_root=project_root)
             self.assertIn("Found 1 memory record(s)", res_search)
-            self.assertIn("agent/goal", res_search)
+            self.assertIn("runbook-agent-goal", res_search)
 
             # 4. memory_delete
-            res_delete = memory_delete(key="agent/goal", project_root=project_root)
-            self.assertIn("Successfully deleted memory key 'agent/goal'", res_delete)
+            res_delete = memory_delete(key="runbook-agent-goal", project_root=project_root)
+            self.assertIn("Successfully deleted memory key 'runbook-agent-goal'", res_delete)
 
             # Confirm deleted
-            res_retrieve_after = memory_retrieve(key="agent/goal", project_root=project_root)
+            res_retrieve_after = memory_retrieve(key="runbook-agent-goal", project_root=project_root)
             self.assertIn("not found", res_retrieve_after)
         finally:
             import shutil
@@ -399,11 +507,11 @@ class TestMCPTools(unittest.TestCase):
         try:
             # 1. memory_get_last before checkpoint exists
             res_initial = memory_get_last(project_root=project_root)
-            self.assertIn("No previous 'system/last_memory' checkpoint found", res_initial)
+            self.assertIn("No previous 'last-memory' checkpoint found", res_initial)
 
             # 2. memory_update_last
             res_update = memory_update_last(
-                content="Completed feature work. Active goal in [Agent Goal](/agent/goal.md).",
+                content="Completed feature work. Active goal in [Agent Goal](/discovery/runbook-agent-goal.md).",
                 summary="Feature X complete",
                 project_root=project_root,
             )
@@ -412,28 +520,33 @@ class TestMCPTools(unittest.TestCase):
             # 3. memory_get_last after checkpoint updated
             res_get = memory_get_last(project_root=project_root)
             self.assertIn("LAST SESSION CHECKPOINT", res_get)
-            self.assertIn("type: Checkpoint", res_get)
+            self.assertIn("type: checkpoint", res_get)
             self.assertIn("Feature X complete", res_get)
-            self.assertIn("Active goal in [Agent Goal](/agent/goal.md)", res_get)
+            self.assertIn("Active goal in [Agent Goal](/discovery/runbook-agent-goal.md)", res_get)
         finally:
             import shutil
             shutil.rmtree(project_root, ignore_errors=True)
 
     def test_missing_project_root_error(self):
-        res = memory_store(key="test/key", content="test content", project_root="")
+        res = memory_store(key="story-test-key", content="test content", project_root="")
         self.assertIn("Error: 'project_root' is required", res)
 
     def test_project_root_override(self):
         custom_root = tempfile.mkdtemp()
         try:
-            res_store = memory_store(key="project/spec", content="Custom project root test", project_root=custom_root)
+            res_store = memory_store(
+                key="story-project-spec",
+                content="Custom project root test",
+                concept_type="story",
+                project_root=custom_root,
+            )
             self.assertIn("Successfully stored memory", res_store)
-            expected_file = os.path.join(custom_root, "memory", "project", "spec.md")
+            expected_file = os.path.join(custom_root, "memory", "discovery", "story-project-spec.md")
             expected_db = os.path.join(custom_root, ".mcp_memory", "memories.db")
-            self.assertTrue(os.path.exists(expected_file))
+            self.assertTrue(os.path.exists(expected_file), expected_file)
             self.assertTrue(os.path.exists(expected_db))
 
-            res_ret = memory_retrieve(key="project/spec", project_root=custom_root)
+            res_ret = memory_retrieve(key="story-project-spec", project_root=custom_root)
             self.assertIn("Custom project root test", res_ret)
         finally:
             import shutil
